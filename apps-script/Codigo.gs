@@ -32,7 +32,7 @@ const COLS_REGISTROS = [
   'Cliente_Destino', 'Obs_Entrada', 'Data_Entrada', 'Status_Cavalo',
   'Status_Carreta', 'Data_Saida_Cavalo', 'Data_Saida_Carreta'
 ];
-const COLS_KANBAN = ['card_id', 'coluna', 'os_atribuidas', 'ordem', 'atualizado_em'];
+const COLS_KANBAN = ['card_id', 'coluna', 'os_atribuidas', 'observacao', 'valor_peca', 'ordem', 'atualizado_em'];
 
 /* ── Roteador GET ───────────────────────────────────────────── */
 function doGet(e) {
@@ -163,8 +163,10 @@ function salvarKanban(body) {
     const agora = new Date();
     const linhas = cards.map(c => [
       String(c.card_id || ''),
-      c.coluna || 'AGUARDANDO',
+      c.coluna || 'AGUARDANDO (ORÇAMENTO / VAGA)',
       String(c.os_atribuidas || ''),
+      String(c.observacao || ''),
+      Number(c.valor_peca) || 0,
       Number(c.ordem) || 0,
       agora
     ]);
@@ -189,6 +191,10 @@ function getOrCreateSheet(nome, cols) {
   if (sh.getLastRow() === 0) {
     sh.getRange(1, 1, 1, cols.length).setValues([cols]);
     sh.setFrozenRows(1);
+  } else if (sh.getLastColumn() < cols.length) {
+    // Migração: completa o cabeçalho quando novas colunas são adicionadas depois
+    const largura = sh.getLastColumn();
+    sh.getRange(1, largura + 1, 1, cols.length - largura).setValues([cols.slice(largura)]);
   }
   return sh;
 }
