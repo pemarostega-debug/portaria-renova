@@ -41,7 +41,7 @@ const PJ_FUSO = 'America/Sao_Paulo';
 // Contas a Pagar/Receber e Ordens de Serviço consultam).
 const PJ_API_LOGIN_PORTAL = 'https://script.google.com/macros/s/AKfycbxmdLCRPZwf6u7l8BnbtqbomFRcjplzJOKCeNWSTRNCKq8M9NtO2uWO7DjEP-xN7WBkkg/exec';
 
-const PJ_ABA = { REG: 'Registros', CFG: 'Config', PES: 'Pessoas', HE: 'HoraExtra', FER: 'Feriados', AUD: 'Auditoria' };
+const PJ_ABA = { REG: 'Registros', CFG: 'Config', PES: 'Pessoas', HE: 'HoraExtra', FER: 'Feriados', AUD: 'Auditoria', SOC: 'Socorros' };
 
 // A ordem das colunas é contrato com o resto do código: só acrescente no FIM.
 const PJ_CAB = {
@@ -50,7 +50,10 @@ const PJ_CAB = {
   PES: ['codigo', 'controle', 'horario', 'foto', 'apelido', 'obs', 'atualizado_por', 'atualizado_em'],
   HE:  ['chave', 'codigo', 'nome', 'dia', 'calc_ss', 'calc_df', 'aprov_ss', 'aprov_df', 'valor_ss', 'valor_df', 'status', 'decidido_por', 'decidido_em', 'obs'],
   FER: ['data', 'descricao'],
-  AUD: ['quando', 'usuario', 'acao', 'alvo', 'detalhe']
+  AUD: ['quando', 'usuario', 'acao', 'alvo', 'detalhe'],
+  // Socorro = atividade extra paga por atendimento. O valor e a faixa ficam GRAVADOS na hora do
+  // lançamento: mudar a tabela de preços depois não mexe no que já foi lançado.
+  SOC: ['id', 'codigo', 'nome', 'inicio', 'fim', 'dia', 'faixa', 'valor', 'usuario', 'recebido_em', 'status', 'obs', 'ref']
 };
 
 // chave, valor inicial, explicação (vai para a coluna C da aba Config).
@@ -72,13 +75,23 @@ const PJ_CFG_PADRAO = [
   ['horas_max_aberto', 16, 'Depois de quantas horas uma entrada sem saída passa a ser tratada como "saída não registrada".'],
   ['evento_seg_sab', 'Gratificação segunda a sabado/hora', 'Nome do evento usado na aba "movimentações" da planilha do RH (segunda a sábado).'],
   ['evento_dom_feriado', 'Gratificação domingos e feriados/hora', 'Nome do evento usado na aba "movimentações" da planilha do RH (domingo e feriado).'],
-  ['jornada_padrao', '', 'Horário usado para quem está sem horário na planilha do RH. Ex.: Seg a Sex 08:00 as 17:00 com 1H intervalo']
+  ['jornada_padrao', '', 'Horário usado para quem está sem horário na planilha do RH. Ex.: Seg a Sex 08:00 as 17:00 com 1H intervalo'],
+  ['jornada_unidade', 'Seg a Sex 08:00 as 17:00 com 1H intervalo e Sab 08:00 as 12:00', 'Horário da unidade da portaria (Jacareí), conforme o comunicado do RH aos PJ. O intervalo de 1h é presumido: o comunicado não o cita.'],
+  ['jornada_unidade_prevalece', 'Sim', 'Sim = o horário da unidade vale para todos da portaria, no lugar do horário da planilha do RH. Um horário digitado à mão para a pessoa (aba Pessoas) continua valendo.'],
+  ['codigos_excluidos', 'PJ_024,PJ_025', 'Códigos do RH que ficam fora da portaria por decisão da gestão (separe por vírgula). Hoje: um híbrido e uma equipe de Guarulhos. Se a pessoa for marcada "Incluir" na aba Pessoas, volta.'],
+  ['valor_socorro_dia', 100, 'R$ por atendimento de socorro de segunda a sábado, quando o atendimento termina até o horário de corte da noite.'],
+  ['valor_socorro_noite', 120, 'R$ por atendimento de socorro de segunda a sábado que termina depois do horário de corte da noite.'],
+  ['valor_socorro_dom_feriado', 120, 'R$ por atendimento de socorro que termina em domingo ou feriado.'],
+  ['socorro_noite_apos', '22:00', 'Horário de corte: socorro que termina DEPOIS dele (segunda a sábado) paga o valor da noite.'],
+  ['socorro_madrugada_ate', '06:00', 'Socorro que termina de madrugada, até este horário, também paga o valor da noite (a faixa noturna atravessa a meia-noite). CONFIRMAR com o RH.']
 ];
 
 // Chaves que o portal pode alterar (as demais só na própria planilha).
 const PJ_CFG_EDITAVEL = ['usuarios_rh', 'prefixos_ignorados', 'valor_hora_seg_sab', 'valor_hora_dom_feriado',
   'tolerancia_min', 'bloco_min', 'conta_antes_do_horario', 'compensa_falta_no_dia', 'desconta_intervalo_dia_livre',
-  'exige_aprovacao', 'horas_max_aberto', 'evento_seg_sab', 'evento_dom_feriado', 'jornada_padrao'];
+  'exige_aprovacao', 'horas_max_aberto', 'evento_seg_sab', 'evento_dom_feriado', 'jornada_padrao',
+  'jornada_unidade', 'jornada_unidade_prevalece', 'codigos_excluidos', 'valor_socorro_dia', 'valor_socorro_noite',
+  'valor_socorro_dom_feriado', 'socorro_noite_apos', 'socorro_madrugada_ate'];
 
 // Memória da execução atual: evita abrir a mesma planilha/aba mais de uma vez.
 let _pj = {};
@@ -342,6 +355,37 @@ function pjFeriadosSugeridos(ano) {
 
 function pjSobrepor(a, b, x, y) { return Math.max(0, Math.min(b, y) - Math.max(a, x)); }
 
+/** Junta intervalos [ini, fim] que se tocam ou se sobrepõem. */
+function pjUnirIntervalos(lista) {
+  const o = lista.filter(function (x) { return x[1] > x[0]; }).sort(function (x, y) { return x[0] - y[0]; }), out = [];
+  o.forEach(function (x) {
+    const u = out[out.length - 1];
+    if (u && x[0] <= u[1]) u[1] = Math.max(u[1], x[1]); else out.push([x[0], x[1]]);
+  });
+  return out;
+}
+
+/**
+ * Minutos de hora extra que o socorro "engole". Socorro é atividade extra paga por
+ * atendimento: dentro do atendimento a pessoa recebe SÓ o socorro, nunca socorro +
+ * hora extra. Só conta o que já seria extra: dentro do expediente nada é absorvido
+ * (aquilo não era hora extra). `J` null = dia sem expediente, tudo seria extra.
+ */
+function pjSocorroAbsorvido(trechos, soc, J, contaAntes) {
+  if (!soc.length) return 0;
+  let tot = 0;
+  trechos.forEach(function (b) {
+    const regioes = [];
+    if (!J) regioes.push([b[0], b[1]]);
+    else {
+      if (contaAntes && b[0] < J.ini) regioes.push([b[0], Math.min(b[1], J.ini)]);
+      if (b[1] > J.fim) regioes.push([Math.max(b[0], J.fim), b[1]]);
+    }
+    regioes.forEach(function (g) { soc.forEach(function (s) { tot += pjSobrepor(g[0], g[1], s[0], s[1]); }); });
+  });
+  return tot;
+}
+
 /**
  * Casa entradas com saídas de UMA pessoa. Tolera o que a vida real produz:
  * duas entradas seguidas (saída esquecida), saída sem entrada, saída depois
@@ -385,7 +429,7 @@ function pjCalcularDia(p) {
   const base = pjAbsDia(p.dia), R = p.regras;
   const r = { trabalhadoMin: 0, previstoMin: 0, faltaMin: 0, antesMin: 0, depoisMin: 0, intervaloDescontadoMin: 0,
               extraBrutoMin: 0, extraMin: 0, minSS: 0, minDF: 0, valorSS: 0, valorDF: 0, valor: 0,
-              incompleto: false, emAndamento: false, semJornada: false, diaLivre: false };
+              socorroAbsorvidoMin: 0, incompleto: false, emAndamento: false, semJornada: false, diaLivre: false };
 
   let blocos = [];
   p.sessoes.forEach(function (s) {
@@ -404,6 +448,10 @@ function pjCalcularDia(p) {
   r.trabalhadoMin = trechos.reduce(function (t, b) { return t + (b[1] - b[0]); }, 0);
 
   if (!p.temJornada) { r.semJornada = true; return r; }
+
+  // Socorro (relativo à meia-noite deste dia), já sem sobreposição entre eles.
+  const soc = pjUnirIntervalos((p.socorros || []).map(function (s) { return [s[0] - base, s[1] - base]; }));
+  r.socorroAbsorvidoMin = 0;
 
   const J = p.jornadaDia;   // null = dia sem expediente para esta pessoa (ou feriado)
   let liquido, amanha;
@@ -425,7 +473,8 @@ function pjCalcularDia(p) {
     r.intervaloDescontadoMin = pausa;
     r.previstoMin = (J.fim - J.ini) - (J.intervalo || 0);
     r.faltaMin = Math.max(0, r.previstoMin - Math.min(dentro - pausa, r.previstoMin));
-    r.extraBrutoMin = r.depoisMin + (R.contaAntes ? r.antesMin : 0);
+    r.socorroAbsorvidoMin = pjSocorroAbsorvido(trechos, soc, J, R.contaAntes);
+    r.extraBrutoMin = Math.max(0, r.depoisMin + (R.contaAntes ? r.antesMin : 0) - r.socorroAbsorvidoMin);
     const abate = (R.compensa && r.faltaMin > R.toleranciaMin) ? r.faltaMin : 0;
     liquido = Math.max(0, r.extraBrutoMin - abate);
     amanha = trechos.reduce(function (t, b) { return t + pjSobrepor(b[0], b[1], Math.max(J.fim, 1440), 1e9); }, 0);
@@ -438,8 +487,9 @@ function pjCalcularDia(p) {
     });
     const pausa = (R.descontaIntervaloLivre && maior > 360) ? Math.max(0, (p.intervaloPadraoMin || 60) - pausaFeita) : 0;
     r.intervaloDescontadoMin = pausa;
-    r.extraBrutoMin = r.trabalhadoMin;
-    liquido = Math.max(0, r.trabalhadoMin - pausa);
+    r.socorroAbsorvidoMin = pjSocorroAbsorvido(trechos, soc, null, false);
+    r.extraBrutoMin = Math.max(0, r.trabalhadoMin - r.socorroAbsorvidoMin);
+    liquido = Math.max(0, r.extraBrutoMin - pausa);
     amanha = trechos.reduce(function (t, b) { return t + pjSobrepor(b[0], b[1], 1440, 1e9); }, 0);
   }
 
@@ -475,9 +525,15 @@ function pjMontarMes(mes, ctx) {
   const porCodigo = {};
   ctx.eventos.forEach(function (e) { (porCodigo[e.codigo] = porCodigo[e.codigo] || []).push(e); });
 
+  const socPorCodigo = {};
+  (ctx.socorros || []).forEach(function (s) { (socPorCodigo[s.codigo] = socPorCodigo[s.codigo] || []).push(s); });
+
   const saida = [];
   ctx.pessoas.forEach(function (p) {
     const sess = pjMontarSessoes(porCodigo[p.codigo] || [], R.maxAbertoMin);
+    const socsPessoa = socPorCodigo[p.codigo] || [];
+    const socIntervalos = socsPessoa.map(function (s) { return [pjAbs(s.inicio), pjAbs(s.fim)]; });
+    const socsDoMes = socsPessoa.filter(function (s) { return s.dia.slice(0, 7) === mes; });
     const porDia = {};
     sess.forEach(function (s) {
       const d = pjDiaDeAbs((s.e || s.s).abs);
@@ -486,7 +542,8 @@ function pjMontarMes(mes, ctx) {
 
     const dias = [];
     const tot = { trabalhadoMin: 0, extraCalcMin: 0, minSS: 0, minDF: 0, valorSS: 0, valorDF: 0, valor: 0,
-                  pendentes: 0, pendenteMin: 0, pendenteValor: 0, incompletos: 0, divergentes: 0, diasComRegistro: 0 };
+                  pendentes: 0, pendenteMin: 0, pendenteValor: 0, incompletos: 0, divergentes: 0, diasComRegistro: 0,
+                  socorroAbsorvidoMin: 0, socorroQtd: 0, socorroValor: 0 };
     const desde = [ctx.inicioControle || '', p.admissao || ''].sort().pop();
 
     for (let d = primeiro; d <= limite; d = pjSomaDias(d, 1)) {
@@ -506,7 +563,7 @@ function pjMontarMes(mes, ctx) {
       const c = pjCalcularDia({
         dia: d, sessoes: S, jornadaDia: jd, temJornada: p.jornada.ok, intervaloPadraoMin: p.jornada.intervaloMin || 60,
         tipoHoje: pjTipoDia(d, ctx.feriados), tipoAmanha: pjTipoDia(pjSomaDias(d, 1), ctx.feriados),
-        regras: R, agoraAbs: agoraAbs
+        regras: R, agoraAbs: agoraAbs, socorros: socIntervalos
       });
 
       // O que vale para o fechamento.
@@ -548,7 +605,7 @@ function pjMontarMes(mes, ctx) {
         sessoes: S.map(function (s) { const o = { e: fmt(s.e), s: fmt(s.s) }; if (s.falha) o.falha = s.falha; if (s.aberta) o.aberta = true; return o; }),
         trabalhadoMin: c.trabalhadoMin, previstoMin: c.previstoMin, faltaMin: c.faltaMin, antesMin: c.antesMin,
         depoisMin: c.depoisMin, intervaloDescontadoMin: c.intervaloDescontadoMin, extraBrutoMin: c.extraBrutoMin,
-        extraMin: c.extraMin, minSS: c.minSS, minDF: c.minDF, valor: c.valor,
+        extraMin: c.extraMin, minSS: c.minSS, minDF: c.minDF, valor: c.valor, socorroAbsorvidoMin: c.socorroAbsorvidoMin,
         incompleto: c.incompleto, emAndamento: c.emAndamento, semJornada: c.semJornada, diaLivre: c.diaLivre,
         decisao: decOut, efetivo: ef
       });
@@ -556,6 +613,7 @@ function pjMontarMes(mes, ctx) {
       tot.diasComRegistro++;
       tot.trabalhadoMin += c.trabalhadoMin;
       tot.extraCalcMin += c.extraMin;
+      tot.socorroAbsorvidoMin += c.socorroAbsorvidoMin;
       if (c.incompleto) tot.incompletos++;
       tot.minSS += ef.minSS; tot.minDF += ef.minDF;
       tot.valorSS = pjDinheiro(tot.valorSS + ef.valorSS); tot.valorDF = pjDinheiro(tot.valorDF + ef.valorDF);
@@ -563,8 +621,12 @@ function pjMontarMes(mes, ctx) {
     }
 
     // Quem não está mais na portaria só entra no mês se tiver algo a mostrar (ex.: desligado no meio do mês).
-    if (!p.naPortaria && !tot.diasComRegistro) return;
+    socsDoMes.forEach(function (s) { tot.socorroQtd++; tot.socorroValor = pjDinheiro(tot.socorroValor + s.valor); });
+    if (!p.naPortaria && !tot.diasComRegistro && !socsDoMes.length) return;
     saida.push({
+      socorros: socsDoMes.map(function (s) {
+        return { id: s.id, dia: s.dia, inicio: s.inicio.slice(0, 16), fim: s.fim.slice(0, 16), faixa: s.faixa, valor: s.valor, por: s.usuario, obs: s.obs };
+      }),
       codigo: p.codigo, nome: p.nome, curto: p.curto, cargo: p.cargo, departamento: p.departamento,
       naPortaria: p.naPortaria, jornadaOk: p.jornada.ok, jornadaResumo: p.jornada.resumo, temFoto: !!p.temFoto, fotoV: p.fotoV || '',
       dias: dias, totais: tot
@@ -768,8 +830,22 @@ function pjRegras(cfg) {
     compensa: pjSim(cfg.compensa_falta_no_dia),
     descontaIntervaloLivre: pjSim(cfg.desconta_intervalo_dia_livre),
     exigeAprovacao: pjSim(cfg.exige_aprovacao),
-    maxAbertoMin: Math.round(Math.min(36, Math.max(6, pjNum(cfg.horas_max_aberto, 16))) * 60)
+    maxAbertoMin: Math.round(Math.min(36, Math.max(6, pjNum(cfg.horas_max_aberto, 16))) * 60),
+    socorroDia: Math.max(0, pjNum(cfg.valor_socorro_dia, 100)),
+    socorroNoite: Math.max(0, pjNum(cfg.valor_socorro_noite, 120)),
+    socorroDF: Math.max(0, pjNum(cfg.valor_socorro_dom_feriado, 120)),
+    socorroNoiteApos: pjHoraCfg(cfg.socorro_noite_apos, 22 * 60),
+    socorroMadrugadaAte: pjHoraCfg(cfg.socorro_madrugada_ate, 6 * 60)
   };
+}
+
+/** "22:00" → 1320. Texto fora do formato cai no padrão. */
+function pjHoraCfg(v, padrao) {
+  let s = String(v === null || v === undefined ? '' : v).trim();
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(s)) s = s.slice(11, 16);   // a planilha às vezes devolve a hora como data
+  const m = s.match(/^(\d{1,2})\s*[:h]\s*(\d{2})$/);
+  if (!m || +m[1] > 23 || +m[2] > 59) return padrao;
+  return +m[1] * 60 + +m[2];
 }
 
 /* ── Feriados ── */
@@ -948,12 +1024,15 @@ function pjPessoas() {
   const cfg = pjCfg(), ajustes = pjAjustes(), fotos = pjFotos().mapa;
   const prefixos = String(cfg.prefixos_ignorados || '').split(/[,;\s]+/).map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
   const padrao = String(cfg.jornada_padrao || '').trim();
+  const unidade = pjSim(cfg.jornada_unidade_prevalece) ? pjParseJornada(String(cfg.jornada_unidade || '').trim()) : null;
+  const excluidos = String(cfg.codigos_excluidos || '').split(/[,;\s]+/).map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
 
   _pj.pessoas = pjBaseRH().filter(function (b) { return b.tipo === 'pj'; }).map(function (b) {
     const x = ajustes[b.codigo] || { controle: 'auto', horario: '', foto: '', apelido: '' };
     const doRH = pjParseJornada(b.horario);
     let jornada = doRH, origemJornada = 'rh';
     if (x.horario) { jornada = pjParseJornada(x.horario); origemJornada = 'ajuste'; }
+    else if (unidade && unidade.ok) { jornada = unidade; origemJornada = 'unidade'; }
     else if (!doRH.ok && padrao) { jornada = pjParseJornada(padrao); origemJornada = 'padrao'; }
 
     const ignorado = prefixos.some(function (p) { return b.codigo.toUpperCase().indexOf(p) === 0; });
@@ -961,6 +1040,7 @@ function pjPessoas() {
     if (!b.ativo) { naPortaria = false; motivo = 'inativo'; }
     else if (x.controle === 'excluir') { naPortaria = false; motivo = 'excluido'; }
     else if (x.controle === 'incluir') naPortaria = true;
+    else if (excluidos.indexOf(b.codigo.toUpperCase()) >= 0) { naPortaria = false; motivo = 'excluido'; }
     else if (doRH.hibrido) { naPortaria = false; motivo = 'hibrido'; }
     else if (ignorado) { naPortaria = false; motivo = 'prefixo'; }
 
@@ -1186,6 +1266,103 @@ function pjFoto(codigo, acesso) {
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════
+   9b. SOCORRO — atividade extra paga por atendimento (não é hora extra)
+   O supervisor lança, na portaria, quem atendeu e de que horas a que horas.
+   A faixa de preço sai da hora do FIM do atendimento. Dentro do atendimento
+   a pessoa recebe só o socorro; hora extra fora dele continua valendo.
+   ═════════════════════════════════════════════════════════════════════════════ */
+
+const PJ_SOCORRO_MAX_MIN = 12 * 60;            // um atendimento não passa de 12h
+const PJ_SOCORRO_DESFAZER_PORTARIA_MIN = 24 * 60;
+
+/** Faixa e valor pela hora do fim: domingo/feriado · noite (depois do corte ou de madrugada) · dia. */
+function pjSocorroFaixa(fim, feriados, R) {
+  const dia = fim.slice(0, 10), min = pjAbs(fim) - pjAbsDia(dia);
+  if (pjTipoDia(dia, feriados) === 'DF') return { faixa: 'DF', valor: R.socorroDF };
+  if (min > R.socorroNoiteApos || min < R.socorroMadrugadaAte) return { faixa: 'NOITE', valor: R.socorroNoite };
+  return { faixa: 'DIA', valor: R.socorroDia };
+}
+
+function pjSocorrosLer() {
+  return pjLerTudo('SOC').map(function (l, i) {
+    return { linha: i + 2, id: String(l[0] || '').trim(), codigo: String(l[1] || '').trim(), nome: String(l[2] || '').trim(),
+             inicio: pjTexto(l[3]), fim: pjTexto(l[4]), dia: pjTexto(l[5]).slice(0, 10), faixa: String(l[6] || '').trim(),
+             valor: pjNum(l[7], 0), usuario: String(l[8] || '').trim(), recebidoEm: pjTexto(l[9]),
+             status: String(l[10] || '').trim().toLowerCase() || 'ok', obs: String(l[11] || '').trim() };
+  }).filter(function (s) { return s.id; });
+}
+
+/** Socorros válidos cujo FIM cai no período (datas 'yyyy-MM-dd', inclusive). */
+function pjSocorrosPeriodo(diaIni, diaFim) {
+  return pjSocorrosLer().filter(function (s) { return s.status === 'ok' && s.dia >= diaIni && s.dia <= diaFim; });
+}
+
+/** Lista para a tela da portaria: sem valores em dinheiro. */
+function pjSocorrosPortaria() {
+  const hoje = pjLocal(pjAgoraMs()), agoraAbs = pjAbs(hoje), ini = pjSomaDias(hoje.slice(0, 10), -60);
+  return {
+    agora: hoje,
+    socorros: pjSocorrosPeriodo(ini, pjSomaDias(hoje.slice(0, 10), 1)).sort(function (a, b) { return a.fim < b.fim ? 1 : -1; }).slice(0, 80)
+      .map(function (s) {
+        return { id: s.id, codigo: s.codigo, nome: s.nome, inicio: s.inicio.slice(0, 16), fim: s.fim.slice(0, 16), faixa: s.faixa,
+                 por: s.usuario, obs: s.obs, podeDesfazer: agoraAbs - pjAbs(s.recebidoEm) <= PJ_SOCORRO_DESFAZER_PORTARIA_MIN };
+      })
+  };
+}
+
+function pjSocorroRegistrar(body, acesso) {
+  const id = String(body.id || '').trim(), codigo = String(body.codigo || '').trim();
+  if (!/^[\w-]{8,64}$/.test(id)) throw pjErro('PEDIDO', 'Lançamento sem identificação.');
+  const inicio = pjValidarDataHoraRH(body.inicio), fim = pjValidarDataHoraRH(body.fim);
+  const dur = pjAbs(fim) - pjAbs(inicio);
+  if (dur <= 0) throw pjErro('PEDIDO', 'O fim do atendimento precisa ser depois do início.');
+  if (dur > PJ_SOCORRO_MAX_MIN) throw pjErro('PEDIDO', 'Atendimento com mais de 12 horas: confira as datas e horas.');
+  if (pjAbs(pjLocal(pjAgoraMs())) - pjAbs(fim) > 30 * 1440) throw pjErro('PEDIDO', 'Socorro com mais de 30 dias: peça ao RH.');
+  const obs = String(body.obs || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+
+  let resp = null;
+  pjComTrava(function () {
+    const p = pjPessoas().filter(function (x) { return x.codigo === codigo && x.naPortaria; })[0];
+    if (!p) throw pjErro('PEDIDO', 'Esse colaborador não está na lista da portaria.');
+    const todos = pjSocorrosLer();
+    const igual = todos.filter(function (s) { return s.id === id; })[0];
+    if (igual) { resp = { repetido: true }; return; }            // reenvio do mesmo toque: não duplica
+    const a = pjAbs(inicio), b = pjAbs(fim);
+    const choque = todos.filter(function (s) { return s.status === 'ok' && s.codigo === codigo && a < pjAbs(s.fim) && b > pjAbs(s.inicio); })[0];
+    if (choque) throw pjErro('PEDIDO', 'Já existe um socorro desse colaborador nesse horário (' + choque.inicio.slice(11, 16) + ' às ' + choque.fim.slice(11, 16) + ').');
+    const f = pjSocorroFaixa(fim, pjFeriados(), pjRegras(pjCfg()));
+    const agora = pjLocal(pjAgoraMs());
+    pjAcrescentar('SOC', [[id, codigo, p.nome, inicio, fim, fim.slice(0, 10), f.faixa, String(f.valor), acesso.usuario, agora, 'ok', obs, '']]);
+    pjAuditar(acesso.usuario, 'socorro_lancado', codigo + ' ' + inicio + ' a ' + fim, { faixa: f.faixa, valor: f.valor, obs: obs });
+    resp = { faixa: f.faixa };
+  });
+  const out = pjSocorrosPortaria();
+  out.resultado = resp;
+  return out;
+}
+
+/** Portaria: só nas primeiras 24h. RH/administração: a qualquer hora. Sempre fica registrado. */
+function pjSocorroDesfazer(body, acesso) {
+  const id = String(body.id || '').trim();
+  pjComTrava(function () {
+    const s = pjSocorrosLer().filter(function (x) { return x.id === id; })[0];
+    if (!s) throw pjErro('NAO_ACHEI', 'Não encontrei esse socorro.');
+    if (s.status !== 'ok') return;
+    const agora = pjLocal(pjAgoraMs());
+    if (acesso.tipo === 'portaria' && pjAbs(agora) - pjAbs(s.recebidoEm) > PJ_SOCORRO_DESFAZER_PORTARIA_MIN) {
+      throw pjErro('TARDE', 'Esse lançamento já não pode ser desfeito na portaria. Avise o RH.');
+    }
+    const motivo = String(body.motivo || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (acesso.tipo === 'rh' && !motivo) throw pjErro('PEDIDO', 'Explique o motivo do cancelamento.');
+    const c = PJ_CAB.SOC.indexOf('status') + 1;
+    pjAba('SOC').getRange(s.linha, c, 1, 3).setNumberFormat('@')
+      .setValues([['cancelado', s.obs, 'cancelado por ' + acesso.usuario + ' em ' + agora + (motivo ? ': ' + motivo : '')]]);
+    pjAuditar(acesso.usuario, 'socorro_cancelado', s.codigo + ' ' + s.inicio + ' a ' + s.fim, { id: id, motivo: motivo });
+  });
+  return pjSocorrosPortaria();
+}
+
+/* ═════════════════════════════════════════════════════════════════════════════
    10. RH — mês, decisões, correções, pessoas e regras
    ═════════════════════════════════════════════════════════════════════════════ */
 
@@ -1209,7 +1386,7 @@ function pjDadosMes(mes) {
   const eventos = pjRegistrosPeriodo(ini, fim).filter(function (r) { return r.status === 'ok'; }).map(pjEvento);
   const feriados = pjFeriados();
   const pessoas = pjMontarMes(mes, { pessoas: pjPessoas(), eventos: eventos, decisoes: pjDecisoes(), feriados: feriados,
-                                     regras: R, agora: agora, inicioControle: pjInicioControle() });
+                                     socorros: pjSocorrosPeriodo(ini, fim), regras: R, agora: agora, inicioControle: pjInicioControle() });
   const feriadosDoMes = [];
   Object.keys(feriados).sort().forEach(function (d) { if (d.slice(0, 7) === mes) feriadosDoMes.push({ data: d, descricao: feriados[d] }); });
   return { mes: mes, agora: agora, regras: R, feriados: feriadosDoMes,
@@ -1391,9 +1568,11 @@ function pjConfigGravar(body, acesso) {
       const n = pjNum(x, NaN);
       if (!isFinite(n) || n < 0 || n > 100000) throw pjErro('PEDIDO', 'Valor inválido em "' + k + '".');
       x = String(n).replace('.', ',');
-    } else if (/^(conta_|compensa_|desconta_|exige_)/.test(k)) x = pjSim(x) ? 'Sim' : 'Não';
+    } else if (/^(conta_|compensa_|desconta_|exige_|jornada_unidade_prevalece)/.test(k)) x = pjSim(x) ? 'Sim' : 'Não';
     else x = String(x === null ? '' : x).replace(/\s+/g, ' ').trim().slice(0, 200);
     if (k === 'jornada_padrao' && x && !pjParseJornada(x).ok) throw pjErro('PEDIDO', 'Não entendi a jornada padrão. Ex.: Seg a Sex 08:00 as 17:00 com 1H intervalo');
+    if (k === 'jornada_unidade' && !pjParseJornada(x).ok) throw pjErro('PEDIDO', 'Não entendi o horário da unidade. Ex.: Seg a Sex 08:00 as 17:00 com 1H intervalo e Sab 08:00 as 12:00');
+    if (/^socorro_(noite_apos|madrugada_ate)$/.test(k) && !/^\d{1,2}:\d{2}$/.test(x)) throw pjErro('PEDIDO', 'Horário inválido em "' + k + '". Use o formato 22:00.');
     limpo[k] = x;
   });
   if (!Object.keys(limpo).length) throw pjErro('PEDIDO', 'Nada para gravar.');
@@ -1491,6 +1670,7 @@ function doGet(e) {
     if (action === 'ping') return pjJson({ success: true, versao: PJ_VERSAO });
 
     if (action === 'pj_estado') { pjAcesso(q.token, 'portaria'); return pjJson({ success: true, data: pjEstado() }); }
+    if (action === 'pj_socorros') { pjAcesso(q.token, 'portaria'); return pjJson({ success: true, data: pjSocorrosPortaria() }); }
     if (action === 'pj_foto') {
       // Porteiro ou RH (o portal também mostra as fotos).
       let a;
@@ -1519,6 +1699,10 @@ function doPost(e) {
 
     if (action === 'pj_registrar') return pjJson({ success: true, data: pjRegistrar(body, pjAcesso(body.token, 'portaria')) });
     if (action === 'pj_desfazer')  return pjJson({ success: true, data: pjDesfazer(body, pjAcesso(body.token, 'portaria')) });
+
+    if (action === 'pj_socorro')          return pjJson({ success: true, data: pjSocorroRegistrar(body, pjAcesso(body.token, 'portaria')) });
+    if (action === 'pj_socorro_desfazer') return pjJson({ success: true, data: pjSocorroDesfazer(body, pjAcesso(body.token, 'portaria')) });
+    if (action === 'rh_socorro_desfazer') return pjJson({ success: true, data: pjSocorroDesfazer(body, pjAcesso(body.token, 'rh')) });
 
     if (action === 'rh_decidir')  return pjJson({ success: true, data: pjDecidir(body, pjAcesso(body.token, 'rh')) });
     if (action === 'rh_registro') return pjJson({ success: true, data: pjAjustarRegistro(body, pjAcesso(body.token, 'rh')) });
@@ -1586,7 +1770,7 @@ function instalar() {
   try { ss.setSpreadsheetTimeZone(PJ_FUSO); ss.setSpreadsheetLocale('pt_BR'); } catch (e) {}
 
   _pj = { ss: ss };
-  ['REG', 'CFG', 'PES', 'HE', 'FER', 'AUD'].forEach(function (k) { pjGarantirAba(ss, k); });
+  ['REG', 'CFG', 'PES', 'HE', 'FER', 'AUD', 'SOC'].forEach(function (k) { pjGarantirAba(ss, k); });
 
   // Config: só acrescenta as chaves que faltam.
   const shCfg = pjAba('CFG'), ult = shCfg.getLastRow();

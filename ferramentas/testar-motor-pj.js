@@ -157,6 +157,16 @@ t('foto de quem não está na base sobra', F.sobras.map(a => a.nome), ['FOTO DES
 const F2 = G.pjCasarFotos(arquivos, base, { PJ_7: 'FOTO DESCONHECIDO.jpeg' });
 t('vínculo manual do RH vence o automático', F2.mapa.PJ_7.nome, 'FOTO DESCONHECIDO.jpeg');
 
+/* ── 6b. Socorro: o que ele "engole" da hora extra ─────────── */
+const JD = { ini: 480, fim: 1020 };   // 08:00–17:00
+t('socorro dentro do expediente não absorve nada', G.pjSocorroAbsorvido([[480, 1020]], [[600, 720]], JD, false), 0);
+t('socorro que passa do horário absorve só a parte depois dele', G.pjSocorroAbsorvido([[480, 1200]], [[960, 1140]], JD, false), 120);
+t('socorro antes do horário só absorve se a regra conta o "antes"', [G.pjSocorroAbsorvido([[360, 600]], [[360, 480]], JD, false), G.pjSocorroAbsorvido([[360, 600]], [[360, 480]], JD, true)], [0, 120]);
+t('dia sem expediente: tudo o que o socorro cobre é absorvido', G.pjSocorroAbsorvido([[480, 780]], [[480, 780]], null, false), 300);
+t('socorro sem o colaborador na portaria não absorve nada (não há extra)', G.pjSocorroAbsorvido([], [[480, 780]], null, false), 0);
+t('socorros emendados/sobrepostos viram um só (sem contar em dobro)', G.pjUnirIntervalos([[600, 700], [650, 800], [800, 900], [1000, 1100]]), [[600, 900], [1000, 1100]]);
+t('sem socorro: nada muda', G.pjSocorroAbsorvido([[480, 1200]], [], JD, false), 0);
+
 /* ── 7. Diversos ───────────────────────────────────────────── */
 t('nome curto', [G.pjNomeCurto('Francisco das Chagas de Oliveira Filho'), G.pjNomeCurto('Ana Claudia da Silva'), G.pjNomeCurto('Beto')],
   ['Francisco das Chagas', 'Ana Claudia', 'Beto']);

@@ -27,11 +27,15 @@ const NAVEGADORES = ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.e
                      'C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome', '/usr/bin/chromium'];
 
 let ok = 0; const falhas = [];
+let ultimoT = '';
 function t(nome, real, esperado) {
+  ultimoT = nome;
   const a = JSON.stringify(real), b = JSON.stringify(esperado);
   if (a === b) ok++; else falhas.push(`${nome}\n    veio:     ${a}\n    esperado: ${b}`);
 }
 const esperar = ms => new Promise(r => setTimeout(r, ms));
+// O mural se redesenha quando a resposta do servidor chega: o clique é feito dentro da página, no elemento que existe naquele instante.
+const clicar = (page, sel) => page.evaluate(s => document.querySelector(s).click(), sel);
 
 /* ── Backend de PJ simulado ── */
 function montarBackend() {
@@ -153,22 +157,22 @@ function servir() {
     t('placar começa em 0/5', await page.$eval('.pj-placar-num', e => e.textContent.replace(/\s/g, '')), '0/5');
 
     // Entrada da Ana
-    await page.click('.pj-card[data-c="PJ_201"] .pj-btn');
+    await clicar(page, '.pj-card[data-c="PJ_201"] .pj-btn');
     t('card fica verde na hora', await page.$eval('.pj-card[data-c="PJ_201"]', e => e.classList.contains('dentro')), true);
     t('confirmação com Desfazer aparece', await page.$eval('#pj-snack', e => e.classList.contains('visivel')), true);
     await page.waitForFunction(() => !PJ.fila.length && !PJ.enviando, { timeout: 8000 });
     t('servidor gravou a entrada', ctrl.getSheetByName('Registros').getLastRow(), 2);
 
     // Toque duplo: o segundo é ignorado
-    await page.click('.pj-card[data-c="PJ_202"] .pj-btn');
-    await page.click('.pj-card[data-c="PJ_202"] .pj-btn');
+    await clicar(page, '.pj-card[data-c="PJ_202"] .pj-btn');
+    await clicar(page, '.pj-card[data-c="PJ_202"] .pj-btn');
     await page.waitForFunction(() => !PJ.fila.length && !PJ.enviando, { timeout: 8000 });
     t('toque duplo não vira entrada+saída', await page.$eval('.pj-card[data-c="PJ_202"]', e => e.classList.contains('dentro')), true);
     t('duas linhas no servidor', ctrl.getSheetByName('Registros').getLastRow(), 3);
 
     // Desfazer
     await esperar(2600);
-    await page.click('.pj-card[data-c="PJ_202"] .pj-btn');     // saída do Bruno...
+    await clicar(page, '.pj-card[data-c="PJ_202"] .pj-btn');     // saída do Bruno...
     await page.click('#pj-snack-desfazer');                     // ...desfeita
     await page.waitForFunction(() => !PJ.fila.length && !PJ.enviando, { timeout: 8000 });
     await esperar(600);
@@ -176,7 +180,7 @@ function servir() {
 
     // Sem internet
     semInternet = true;
-    await page.click('.pj-card[data-c="PJ_203"] .pj-btn');
+    await clicar(page, '.pj-card[data-c="PJ_203"] .pj-btn');
     await esperar(700);
     t('sem internet: card muda mesmo assim', await page.$eval('.pj-card[data-c="PJ_203"]', e => e.classList.contains('dentro')), true);
     t('sem internet: fila guardada no aparelho', await page.evaluate(() => JSON.parse(localStorage.getItem('portaria_pj_fila')).length), 1);
@@ -191,10 +195,36 @@ function servir() {
     // Busca e filtro
     await page.type('#pj-busca', 'carl');
     t('busca pelo nome', await page.$$eval('.pj-card', c => c.map(x => x.dataset.c)), ['PJ_203']);
-    await page.click('#pj-busca', { clickCount: 3 }); await page.keyboard.press('Backspace');
+    await page.evaluate(() => { const b = document.getElementById('pj-busca'); b.value = ''; b.dispatchEvent(new Event('input', { bubbles: true })); });
     await page.click('.pj-chip[data-filtro="fora"]');
     t('filtro "Fora"', await page.$$eval('.pj-card', c => c.length), 2);
     await page.click('.pj-chip[data-filtro="todos"]');
+
+    // Socorro: o supervisor lança quem fez e quando; só o servidor calcula a faixa e o valor
+    await page.click('#pj-soc summary');
+    await page.waitForFunction(() => document.querySelectorAll('#pj-soc-pessoa option').length === 6, { timeout: 8000 });
+    t('socorro: lista de quem pode ser escolhido (5 PJ + "escolha")', await page.$$eval('#pj-soc-pessoa option', o => o.length), 6);
+    t('socorro: o dia já vem preenchido com hoje', await page.$eval('#pj-soc-data', e => !!e.value), true);
+    await page.click('#pj-soc-btn');
+    t('socorro: sem escolher a pessoa, avisa', await page.$eval('#pj-soc-erro', e => e.textContent), 'Escolha quem fez o socorro.');
+    const hm = d => new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+    const fimHM = hm(new Date(Date.now() - 60e3)), iniHM = hm(new Date(Date.now() - 31 * 60e3));
+    await page.select('#pj-soc-pessoa', 'PJ_202');
+    await page.evaluate((i, f) => {
+      [['pj-soc-ini', i], ['pj-soc-fim', f]].forEach(([id, v]) => { const e = document.getElementById(id); e.value = v; e.dispatchEvent(new Event('input', { bubbles: true })); });
+      document.getElementById('pj-soc-obs').value = 'Teste: caminhão parado';
+    }, iniHM, fimHM);
+    t('socorro: prévia mostra início, fim e duração', await page.$eval('#pj-soc-previa', e => e.textContent.includes('30 min')), true);
+    await page.click('#pj-soc-btn');
+    await page.waitForFunction(() => (PJ.socorros || []).length === 1, { timeout: 8000 });
+    t('socorro: gravado na aba Socorros', ctrl.getSheetByName('Socorros').getLastRow(), 2);
+    t('socorro: aparece na lista com a faixa e sem valor em dinheiro', await page.$eval('#pj-soc-lista', e => [/Bruno/.test(e.textContent), !!e.querySelector('.pj-soc-faixa'), /R\$/.test(e.textContent)]), [true, true, false]);
+    t('socorro: formulário limpo depois de lançar', await page.$eval('#pj-soc-ini', e => e.value), '');
+    await page.click('.pj-soc-desfazer');
+    await page.waitForFunction(() => (PJ.socorros || []).length === 0, { timeout: 8000 });
+    t('socorro: desfazer tira da lista', await page.$eval('#pj-soc-n', e => e.textContent), 'nenhum');
+    t('socorro: cancelado na planilha', ctrl.getSheetByName('Socorros').getRange(2, 11).getValue(), 'cancelado');
+    if (CAPTURAS) await page.screenshot({ path: path.join(CAPTURAS, 'portaria-pj-socorro-375.png'), fullPage: true });
 
     t('sem rolagem horizontal no celular (PJ)', await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0);
     if (CAPTURAS) await page.screenshot({ path: path.join(CAPTURAS, 'portaria-pj-375.png'), fullPage: true });
@@ -202,7 +232,8 @@ function servir() {
     // Recarregar a página: continua no módulo PJ e sem pedir senha de novo
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.evaluate(() => { CONFIG.PJ_API_URL = window.__PJ_URL; });
-    await page.type('#inp-senha', 'teste-1234'); await page.click('.btn-entrar');
+    if (await page.$eval('#tela-login', e => e.offsetParent !== null).catch(() => false)) { await page.type('#inp-senha', 'teste-1234'); await page.click('.btn-entrar'); }
+    await page.evaluate(() => { if (document.getElementById('app').style.display === 'flex') trocarModulo('pj'); });   // entrou sozinho, antes do teste ligar o endereço do PJ
     await page.waitForSelector('.pj-card', { timeout: 8000 });
     t('aparelho continua liberado e no módulo PJ', await page.$$eval('.pj-card.dentro', c => c.length), 3);
 
@@ -213,18 +244,18 @@ function servir() {
     t('um campo de placa só', await page.$$eval('.form-input.placa', i => i.filter(x => x.offsetParent).length), 1);
     t('rótulo da placa acompanha o tipo', await page.$eval('#rotulo-placa', e => e.textContent), 'Placa da carreta');
     await page.type('#inp-placa', 'ccc3c33');
-    await page.click('#btn-registrar');
-    await esperar(600);
+    await clicar(page, '#btn-registrar');
+    for (let i = 0; i < 50 && veic.reg.length < 2; i++) await esperar(100);
     const nova = veic.reg[veic.reg.length - 1];
     t('carreta gravada na coluna da carreta', [nova.Tipo_Veiculo, nova.Placa_Cavalo, nova.Placa_Carreta], ['Carreta', '', 'CCC3C33']);
 
     await page.click('.nav-aba[data-aba="patio"]');
     await page.waitForSelector('.veiculo-card');
     t('nome com HTML aparece como texto (sem injeção)', await page.$eval('.veiculo-card .veiculo-info', e => e.innerHTML.includes('<b>')), false);
-    await page.click('.veiculo-card .btn-saida');
+    await clicar(page, '.veiculo-card .btn-saida');
     t('conjunto antigo: escolhe cada placa, sem "conjunto completo"', await page.$$eval('.opcao-saida strong', s => s.map(x => x.textContent)), ['Saída do cavalo', 'Saída da carreta']);
-    await page.click('.opcao-saida:nth-child(2)');
-    await page.click('#btn-confirmar-saida');
+    await clicar(page, '.opcao-saida:nth-child(2)');
+    await clicar(page, '#btn-confirmar-saida');
     await esperar(700);
     t('saiu só a carreta', [veic.reg[0].Status_Cavalo, veic.reg[0].Status_Carreta], ['No Pátio', 'Saiu']);
     t('sem rolagem horizontal no celular (equipamentos)', await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0);
@@ -235,13 +266,14 @@ function servir() {
     if (CAPTURAS) {
       const p2 = await abrir(1024);
       await p2.type('#inp-senha', 'teste-1234'); await p2.click('.btn-entrar');
+      await p2.evaluate(() => { trocarModulo('pj'); });
       await p2.waitForSelector('.pj-card', { timeout: 8000 });
       await esperar(900);
       await p2.screenshot({ path: path.join(CAPTURAS, 'portaria-pj-1024.png'), fullPage: true });
       await p2.close();
     }
   } catch (e) {
-    falhas.push('parou: ' + e.message);
+    falhas.push('parou depois de "' + ultimoT + '": ' + String(e.stack || e.message).split('\n').slice(0, 4).join(' / '));
   } finally {
     await browser.close();
     servidor.close();

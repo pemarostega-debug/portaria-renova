@@ -937,6 +937,17 @@ html, body {
 .pj-mov-tipo.SAIDA { background: var(--cinza-200); color: var(--cinza-600); }
 .pj-mov-nome { flex: 1; color: var(--cinza-800); }
 .pj-mov-pend { color: var(--amarelo); font-size: 11px; }
+.pj-soc-form { padding: 4px 16px 16px; border-top: 1px solid var(--cinza-100); }
+.pj-soc-form .form-label { display: block; margin: 12px 0 5px; }
+.pj-soc-ajuda { font-size: 12.5px; color: var(--cinza-600); line-height: 1.45; margin-top: 10px; }
+.pj-soc-horas { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pj-soc-previa { margin-top: 12px; font-size: 13px; font-weight: 600; color: var(--azul-escuro); min-height: 18px; }
+.pj-soc-item { flex-wrap: wrap; }
+.pj-soc-quando { color: var(--cinza-600); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pj-soc-faixa { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.03em; background: var(--cinza-200); color: var(--cinza-600); }
+.pj-soc-faixa.NOITE, .pj-soc-faixa.DF { background: var(--amarelo-claro); color: #92400e; }
+.pj-soc-desfazer { border: 1px solid var(--cinza-200); background: white; color: var(--vermelho); border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.pj-soc-obs { flex-basis: 100%; font-size: 12px; color: var(--cinza-600); padding-left: 54px; }
 
 .pj-snack {
   position: fixed; left: 50%; bottom: 20px; transform: translate(-50%, 140%); z-index: 900;
@@ -1246,6 +1257,28 @@ html, body {
       <details class="pj-mov" id="pj-mov">
         <summary><i class="fas fa-list-ul"></i> Movimentos de hoje <span id="pj-mov-n"></span></summary>
         <div id="pj-mov-lista"></div>
+      </details>
+
+      <!-- Socorro: atividade extra paga por atendimento (o supervisor lança quem fez e quando) -->
+      <details class="pj-mov" id="pj-soc" ontoggle="if(this.open)pjSocCarregar()">
+        <summary><i class="fas fa-truck-medical"></i> Socorros <span id="pj-soc-n"></span></summary>
+        <div class="pj-soc-form">
+          <p class="pj-soc-ajuda">Lance o atendimento de socorro depois que ele terminar. No socorro a pessoa recebe só o valor do atendimento, sem hora extra nesse período.</p>
+          <label class="form-label" for="pj-soc-pessoa">Quem fez o socorro</label>
+          <select id="pj-soc-pessoa" class="form-select"></select>
+          <label class="form-label" for="pj-soc-data">Dia em que o atendimento terminou</label>
+          <input type="date" id="pj-soc-data" class="form-input">
+          <div class="pj-soc-horas">
+            <div><label class="form-label" for="pj-soc-ini">Início</label><input type="time" id="pj-soc-ini" class="form-input"></div>
+            <div><label class="form-label" for="pj-soc-fim">Fim</label><input type="time" id="pj-soc-fim" class="form-input"></div>
+          </div>
+          <label class="form-label" for="pj-soc-obs">Observação (opcional)</label>
+          <input type="text" id="pj-soc-obs" class="form-input" maxlength="200" placeholder="Ex.: caminhão parado na estrada">
+          <div class="pj-soc-previa" id="pj-soc-previa"></div>
+          <div class="login-erro" id="pj-soc-erro"></div>
+          <button class="btn btn-primario mt-12" id="pj-soc-btn" onclick="pjSocEnviar()"><i class="fas fa-check"></i> Lançar socorro</button>
+        </div>
+        <div id="pj-soc-lista"></div>
       </details>
     </div>
 
@@ -2175,6 +2208,103 @@ async function pjDesfazerNoServidor(id) {
     if (d.success) { pjAplicarEstado(d.data.estado); showToast('Registro desfeito.', 'sucesso'); }
     else if (!pjSessaoCaiu(d)) { showToast(d.error || 'Não deu para desfazer.', 'erro'); pjAtualizar(); }
   } catch (_) { showToast('Sem conexão para desfazer. Tente de novo ou avise o RH.', 'erro'); pjAtualizar(); }
+}
+
+// ── Socorro (atividade extra paga por atendimento; precisa de internet, não entra na fila offline) ──
+PJ.socorros = null; PJ.socId = null;
+const PJ_SOC_FAIXA = { DIA: 'Dia', NOITE: 'Noite', DF: 'Dom/feriado' };
+
+function pjSocDiaAnterior(d) {
+  const x = new Date(d + 'T12:00:00Z'); x.setUTCDate(x.getUTCDate() - 1);
+  return x.toISOString().slice(0, 10);
+}
+function pjSocDataBR(d) { return d.slice(8, 10) + '/' + d.slice(5, 7); }
+
+/** Início e fim completos. Se a hora de início for maior que a do fim, o atendimento começou no dia anterior. */
+function pjSocHorarios() {
+  const dia = document.getElementById('pj-soc-data').value, ini = document.getElementById('pj-soc-ini').value, fim = document.getElementById('pj-soc-fim').value;
+  if (!dia || !ini || !fim) return null;
+  const diaIni = ini > fim ? pjSocDiaAnterior(dia) : dia;
+  const min = h => +h.slice(0, 2) * 60 + +h.slice(3, 5);
+  let dur = min(fim) - min(ini); if (dur <= 0) dur += 1440;
+  return { inicio: diaIni + ' ' + ini, fim: dia + ' ' + fim, diaIni, dur, viraDia: diaIni !== dia };
+}
+
+function pjSocPreencherPessoas() {
+  const sel = document.getElementById('pj-soc-pessoa'), atual = sel.value;
+  const pessoas = ((PJ.estado && PJ.estado.pessoas) || []).filter(p => !p.foraDaLista);
+  sel.innerHTML = '<option value="">Escolha o colaborador…</option>' +
+    pessoas.map(p => `<option value="${esc(p.codigo)}">${esc(p.curto)}</option>`).join('');
+  sel.value = pessoas.some(p => p.codigo === atual) ? atual : '';
+  const d = document.getElementById('pj-soc-data');
+  if (!d.value && PJ.estado) d.value = PJ.estado.dia;
+}
+
+function pjSocPrevia() {
+  const h = pjSocHorarios(), el = document.getElementById('pj-soc-previa');
+  PJ.socId = null;   // mudou algo: um novo envio é um novo lançamento
+  if (!h) { el.textContent = ''; return; }
+  el.textContent = `Das ${h.inicio.slice(11)} às ${h.fim.slice(11)} (${pjDur(h.dur)})` + (h.viraDia ? ` — começou no dia ${pjSocDataBR(h.diaIni)}` : '');
+}
+['pj-soc-pessoa', 'pj-soc-data', 'pj-soc-ini', 'pj-soc-fim'].forEach(id => {
+  document.getElementById(id).addEventListener('input', pjSocPrevia);
+});
+
+async function pjSocCarregar() {
+  pjSocPreencherPessoas();
+  if (!pjToken()) return;
+  try {
+    const d = await pjGet({ action: 'pj_socorros', token: pjToken() });
+    if (d.success) { PJ.socorros = d.data.socorros; pjSocRender(); }
+    else if (!pjSessaoCaiu(d)) showToast(d.error || 'Não deu para carregar os socorros.', 'erro');
+  } catch (_) { document.getElementById('pj-soc-lista').innerHTML = '<div class="pj-vazio">Sem conexão para carregar os socorros.</div>'; }
+}
+
+function pjSocRender() {
+  const lista = PJ.socorros || [];
+  document.getElementById('pj-soc-n').textContent = lista.length ? lista.length + (lista.length === 1 ? ' lançamento' : ' lançamentos') : 'nenhum';
+  document.getElementById('pj-soc-lista').innerHTML = lista.map(s => `
+    <div class="pj-mov-item pj-soc-item">
+      <span class="pj-mov-nome"><strong>${esc((pjPessoa(s.codigo) || {}).curto || s.nome)}</strong><br>
+        <span class="pj-soc-quando">${esc(pjSocDataBR(s.inicio.slice(0, 10)))} ${esc(s.inicio.slice(11))} → ${esc(pjSocDataBR(s.fim.slice(0, 10)))} ${esc(s.fim.slice(11))}</span></span>
+      <span class="pj-soc-faixa ${esc(s.faixa)}">${esc(PJ_SOC_FAIXA[s.faixa] || s.faixa)}</span>
+      ${s.podeDesfazer ? `<button class="pj-soc-desfazer" data-id="${esc(s.id)}" onclick="pjSocDesfazer(this.dataset.id)">Desfazer</button>` : ''}
+      ${s.obs ? `<span class="pj-soc-obs">${esc(s.obs)}</span>` : ''}
+    </div>`).join('');
+}
+
+async function pjSocEnviar() {
+  const erro = document.getElementById('pj-soc-erro'), btn = document.getElementById('pj-soc-btn');
+  erro.textContent = '';
+  const codigo = document.getElementById('pj-soc-pessoa').value, h = pjSocHorarios();
+  if (!codigo) { erro.textContent = 'Escolha quem fez o socorro.'; return; }
+  if (!h) { erro.textContent = 'Preencha o dia, a hora de início e a hora de fim.'; return; }
+  const p = pjPessoa(codigo);
+  if (!confirm(`Lançar socorro de ${p ? p.curto : codigo}?\n\nInício: ${pjSocDataBR(h.diaIni)} às ${h.inicio.slice(11)}\nFim: ${pjSocDataBR(h.fim.slice(0, 10))} às ${h.fim.slice(11)} (${pjDur(h.dur)})`)) return;
+  if (!PJ.socId) PJ.socId = 'soc-' + pjUuid();    // mesmo id se a conexão cair e você tocar de novo: não duplica
+  btn.disabled = true;
+  try {
+    const d = await pjPost({ action: 'pj_socorro', token: pjToken(), id: PJ.socId, codigo, inicio: h.inicio, fim: h.fim,
+                             obs: document.getElementById('pj-soc-obs').value });
+    if (d.success) {
+      PJ.socorros = d.data.socorros; pjSocRender();
+      ['pj-soc-ini', 'pj-soc-fim', 'pj-soc-obs'].forEach(id => { document.getElementById(id).value = ''; });
+      document.getElementById('pj-soc-pessoa').value = '';
+      document.getElementById('pj-soc-previa').textContent = '';
+      PJ.socId = null;
+      showToast('Socorro lançado.', 'sucesso');
+    } else if (!pjSessaoCaiu(d)) erro.textContent = d.error || 'Não foi possível lançar.';
+  } catch (_) { erro.textContent = 'Sem conexão. Nada foi perdido: toque em Lançar de novo quando a internet voltar.'; }
+  finally { btn.disabled = false; }
+}
+
+async function pjSocDesfazer(id) {
+  if (!confirm('Desfazer esse lançamento de socorro?')) return;
+  try {
+    const d = await pjPost({ action: 'pj_socorro_desfazer', token: pjToken(), id });
+    if (d.success) { PJ.socorros = d.data.socorros; pjSocRender(); showToast('Socorro desfeito.', 'sucesso'); }
+    else if (!pjSessaoCaiu(d)) { showToast(d.error || 'Não deu para desfazer.', 'erro'); pjSocCarregar(); }
+  } catch (_) { showToast('Sem conexão para desfazer. Tente de novo.', 'erro'); }
 }
 
 // ── Filtros ──
