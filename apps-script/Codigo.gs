@@ -38,9 +38,10 @@ const COLS_KANBAN = ['card_id', 'coluna', 'os_atribuidas', 'observacao', 'valor_
 function doGet(e) {
   const action = ((e && e.parameter && e.parameter.action) || '').toLowerCase();
   try {
-    if (action === 'patio')      return json({ success: true, data: lerPatio() });
-    if (action === 'historico')  return json({ success: true, data: lerHistorico(e.parameter.data) });
-    if (action === 'kanban_get') return json({ success: true, data: lerKanban() });
+    if (action === 'patio')         return json({ success: true, data: lerPatio() });
+    if (action === 'historico')     return json({ success: true, data: lerHistorico(e.parameter.data) });
+    if (action === 'historico_range') return json({ success: true, data: buscarHistorico(e.parameter) });
+    if (action === 'kanban_get')    return json({ success: true, data: lerKanban() });
     return json({ success: false, error: 'Ação desconhecida: ' + action });
   } catch (err) {
     return json({ success: false, error: String(err) });
@@ -79,35 +80,80 @@ function lerHistorico(dataStr) {
   });
 }
 
+/* ── BUSCA (histórico por intervalo de datas + placa) ───────── */
+function buscarHistorico(params) {
+  params = params || {};
+  const dataInicio = params.dataInicio || '';
+  const dataFim     = params.dataFim || dataInicio;
+  const placa       = String(params.placa || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const tz = ss().getSpreadsheetTimeZone();
+
+  return lerRegistros().filter(r => {
+    if (!r.Data_Entrada) return false;
+    const diaEntrada = Utilities.formatDate(new Date(r.Data_Entrada), tz, 'yyyy-MM-dd');
+    if (dataInicio && diaEntrada < dataInicio) return false;
+    if (dataFim && diaEntrada > dataFim) return false;
+
+    if (placa) {
+      const pCavalo  = String(r.Placa_Cavalo  || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const pCarreta = String(r.Placa_Carreta || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (pCavalo.indexOf(placa) === -1 && pCarreta.indexOf(placa) === -1) return false;
+    }
+    return true;
+  }).sort((a, b) => new Date(b.Data_Entrada) - new Date(a.Data_Entrada));
+}
+
 /* ── ENTRADA (novo veículo no pátio) ────────────────────────── */
+/*
+ * Cada placa entra sozinha (desde 11/2026 não existe mais "Conjunto").
+ * Se um aparelho com a versão antiga da portaria ainda mandar Conjunto
+ * (ex.: fila offline antiga), ele vira DOIS registros: um Cavalo e uma
+ * Carreta, cada um saindo quando sair.
+ */
 function registrarEntrada(body) {
-  const sh   = getOrCreateSheet(ABA_REGISTROS, COLS_REGISTROS);
-  const tipo = body.Tipo_Veiculo || '';
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return { success: false, error: 'Sistema ocupado. Tente de novo em alguns segundos.' };
+  try {
+    const sh   = getOrCreateSheet(ABA_REGISTROS, COLS_REGISTROS);
+    const tipo = String(body.Tipo_Veiculo || '').trim();
+    const limpa = p => String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 7);
 
-  // Define status inicial conforme o tipo de equipamento
-  let statusCavalo  = 'N/A';
-  let statusCarreta = 'N/A';
-  if (tipo === 'Conjunto')      { statusCavalo = 'No Pátio'; statusCarreta = 'No Pátio'; }
-  else if (tipo === 'Carreta')  { statusCarreta = 'No Pátio'; }
-  else                          { statusCavalo = 'No Pátio'; } // Cavalo, Truck, Utilitário, Visitante
+    const itens = tipo === 'Conjunto'
+      ? [{ tipo: 'Cavalo', cavalo: limpa(body.Placa_Cavalo), carreta: '' },
+         { tipo: 'Carreta', cavalo: '', carreta: limpa(body.Placa_Carreta) }]
+      : [{ tipo: tipo,
+           cavalo: tipo === 'Carreta' ? '' : limpa(body.Placa_Cavalo || body.Placa_Carreta),
+           carreta: tipo === 'Carreta' ? limpa(body.Placa_Carreta || body.Placa_Cavalo) : '' }];
 
-  const id   = proximoId(sh);
-  const linha = [
-    id,
-    tipo,
-    body.Placa_Cavalo    || '',
-    body.Placa_Carreta   || '',
-    body.Motorista       || '',
-    body.Cliente_Destino || '',
-    body.Obs_Entrada     || '',
-    new Date(),
-    statusCavalo,
-    statusCarreta,
-    '',
-    ''
-  ];
-  sh.appendRow(linha);
-  return { success: true, id: id, rowIndex: sh.getLastRow() };
+    // A mesma placa não pode estar duas vezes no pátio.
+    const noPatio = {};
+    lerPatio().forEach(r => {
+      if (r.Status_Cavalo === 'No Pátio' && r.Placa_Cavalo) noPatio[limpa(r.Placa_Cavalo)] = r.ID;
+      if (r.Status_Carreta === 'No Pátio' && r.Placa_Carreta) noPatio[limpa(r.Placa_Carreta)] = r.ID;
+    });
+    for (const it of itens) {
+      if (it.tipo !== 'Visitante' && !(it.cavalo || it.carreta)) return { success: false, error: 'Informe a placa.' };
+      const placa = it.cavalo || it.carreta;
+      if (placa && noPatio[placa]) return { success: false, error: 'A placa ' + placa + ' já está no pátio (' + noPatio[placa] + '). Dê saída nela antes de registrar de novo.' };
+    }
+
+    const ids = [];
+    itens.forEach(it => {
+      const id = proximoId(sh);
+      sh.appendRow([
+        id, it.tipo, it.cavalo, it.carreta,
+        body.Motorista || '', body.Cliente_Destino || '', body.Obs_Entrada || '',
+        new Date(),
+        it.tipo === 'Carreta' ? 'N/A' : 'No Pátio',
+        it.tipo === 'Carreta' ? 'No Pátio' : 'N/A',
+        '', ''
+      ]);
+      ids.push(id);
+    });
+    return { success: true, id: ids.join(' e '), rowIndex: sh.getLastRow() };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /* ── SAÍDA (cavalo, carreta ou conjunto) ────────────────────── */
